@@ -11,9 +11,8 @@
 #include <stdio.h>
 #include <memory.h>
 #include <net/if.h>
-#include<sys/time.h>
-
-#include "stream_reader.h"
+#include <sys/time.h>
+#include "amba_stream_reader.h"
 #include "h264.h"
 
 // #define _DEBUG_ENABLE
@@ -42,29 +41,12 @@ typedef struct
     uint16_t lost_packets;  //! true, if packet loss is detected
 } NALU_t;
 
-static stream_reader_t *fStream_reader;
-static stream_reader_init_info_t stream_init_info = {0};
-static stream_fifo_reader_init_t fifo_init_info;
-static stream_fifo_reader_t	*fFifo_reader;
-
 static int32_t info2=0, info3=0;
 static RTP_FIXED_HEADER *rtp_hdr;
 
 static NALU_HEADER     *nalu_hdr;
 static FU_INDICATOR    *fu_ind;
 static FU_HEADER       *fu_hdr;
-
-
-int open_video_fifo_reader(void)
-{
-	int ret = 0;
-
-	StreamReader_CreateHandle(&fStream_reader, &stream_init_info);
-	fifo_init_info.fifo_type = STREAM_TRACK_VIDEO;
-    fifo_init_info.stream_type = STREAM_TYPE_LIVE;
-    fifo_init_info.fifo_cache_size = MAX_VIDEO_FIFO_CACHE_SIZE_LIVE;
-    return StreamReader_OpenVFifoReader(fStream_reader, &fifo_init_info, &fFifo_reader);
-}
 
 //为NALU_t结构体分配内存空间
 NALU_t *AllocNALU(int buffersize)
@@ -232,20 +214,18 @@ int main(int argc, char* argv[])
 
     n = AllocNALU(8000000);
 
-	if (open_video_fifo_reader() < 0) {
-		perror("open video fifo failed\n");
+	if (stream_reader_init() != 0) {
+		perror("stream reader init failed\n");
 		exit(1);
 	}
 
-	StreamReader_StartVFifo(fStream_reader, fFifo_reader);
-
-	stream_reader_frame_info_t frame_info = {0};
-	StreamReader_GetFrame(fStream_reader, fFifo_reader, &frame_info);
-	while (frame_info.frame_size == 0) {
-		StreamReader_FreeFrame(fStream_reader, fFifo_reader, NULL);
-		usleep(15000);
-		StreamReader_GetFrame(fStream_reader, fFifo_reader, &frame_info);
+	if (stream_reader_start() != 0) {
+		perror("stream reader start failed\n");
+		exit(1);
 	}
+
+	frame_info_s frame_info = {0};
+	stream_reader_get_frame_block(&frame_info);
 
 	int eof = 0;
 	ssize_t send_size = 0;
@@ -253,14 +233,7 @@ int main(int argc, char* argv[])
 
     while(1) {
     	if (eof) {
-    		StreamReader_FreeFrame(fStream_reader, fFifo_reader, NULL);
-
-			StreamReader_GetFrame(fStream_reader, fFifo_reader, &frame_info);
-			while (frame_info.frame_size == 0 || frame_info.pts == prev_pts) {
-				StreamReader_FreeFrame(fStream_reader, fFifo_reader, NULL);
-				usleep(5000);
-				StreamReader_GetFrame(fStream_reader, fFifo_reader, &frame_info);
-			}
+			stream_reader_get_frame_block(&frame_info);
 
 			prev_pts = frame_info.pts;
 			ts_current = ts_current + timestamp_increse;
