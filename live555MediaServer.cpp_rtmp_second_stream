@@ -1,0 +1,889 @@
+/*  RTMPDump
+ *  Copyright (C) 2009 Andrej Stepanchuk
+ *  Copyright (C) 2009 Howard Chu
+ *
+ *  This Program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2, or (at your option)
+ *  any later version.
+ *
+ *  This Program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with RTMPDump; see the file COPYING.  If not, write to
+ *  the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+ *  Boston, MA  02110-1301, USA.
+ *  http://www.gnu.org/copyleft/gpl.html
+ *
+ */
+
+#define _FILE_OFFSET_BITS	64
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <signal.h>		// to catch Ctrl-C
+#include <getopt.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/times.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+
+#include "librtmp/rtmp.h"
+#include "librtmp/log.h"
+#include "stream_reader.h"
+
+#ifdef WIN32
+#define fseeko fseeko64
+#define ftello ftello64
+#include <io.h>
+#include <fcntl.h>
+#define	SET_BINMODE(f)	setmode(fileno(f), O_BINARY)
+#else
+#define	SET_BINMODE(f)
+#endif
+
+#define NALU_TYPE_SLICE    1
+#define NALU_TYPE_DPA      2
+#define NALU_TYPE_DPB      3
+#define NALU_TYPE_DPC      4
+#define NALU_TYPE_IDR      5
+#define NALU_TYPE_SEI      6
+#define NALU_TYPE_SPS      7
+#define NALU_TYPE_PPS      8
+#define NALU_TYPE_AUD      9
+#define NALU_TYPE_EOSEQ    10
+#define NALU_TYPE_EOSTREAM 11
+#define NALU_TYPE_FILL     12
+
+
+#define RD_SUCCESS		0
+#define RD_FAILED		1
+#define RD_INCOMPLETE		2
+
+#define DEF_TIMEOUT	30	/* seconds */
+#define DEF_BUFTIME	(10 * 60 * 60 * 1000)	/* 10 hours default */
+#define DEF_SKIPFRM	0
+
+#define MAX_VIDEO_FIFO_CACHE_SIZE_LIVE            (512 << 10) // 512KB
+
+#ifdef _DEBUG_ENABLE
+#define DBG_MSG printf
+#else
+#define DBG_MSG
+#endif
+
+#ifdef _DEBUG
+uint32_t debugTS = 0;
+int pnum = 0;
+
+FILE *netstackdump = 0;
+FILE *netstackdump_read = 0;
+#endif
+
+uint32_t nIgnoredFlvFrameCounter = 0;
+uint32_t nIgnoredFrameCounter = 0;
+#define MAX_IGNORED_FRAMES	50
+
+#define RTMP_HEAD_SIZE   (sizeof(RTMPPacket)+RTMP_MAX_HEADER_SIZE)
+
+typedef struct _NaluUnit
+{
+	int type;
+    int size;
+	unsigned char *data;
+}NaluUnit;
+
+typedef struct _RTMPMetadata
+{
+	// video, must be h264 type
+	unsigned int    nWidth;
+	unsigned int    nHeight;
+	unsigned int    nFrameRate;
+	unsigned int    nSpsLen;
+	unsigned char   *Sps;
+	unsigned int    nPpsLen;
+	unsigned char   *Pps;
+} RTMPMetadata,*LPRTMPMetadata;
+
+enum
+{
+	 VIDEO_CODECID_H264 = 7,
+};
+
+
+
+FILE *file = 0;
+
+#define HEX2BIN(a)      (((a)&0x40)?((a)&0xf)+9:((a)&0xf))
+
+static const AVal av_onMetaData = AVC("onMetaData");
+static const AVal av_duration = AVC("duration");
+static const AVal av_conn = AVC("conn");
+static const AVal av_token = AVC("token");
+static const AVal av_playlist = AVC("playlist");
+static const AVal av_true = AVC("true");
+
+#define STR2AVAL(av,str)	av.av_val = str; av.av_len = strlen(av.av_val)
+
+
+static FILE *fp_send1;
+static stream_reader_t *fStream_reader;
+static stream_reader_init_info_t stream_init_info = {0};
+static stream_fifo_reader_init_t fifo_init_info;
+static stream_fifo_reader_t	*fFifo_reader;
+
+static unsigned char* frame_buffer = NULL;
+static unsigned int frame_size = 0;
+
+static int InitSockets(void)
+{
+#ifdef WIN32
+  WORD version;
+  WSADATA wsaData;
+
+  version = MAKEWORD(1, 1);
+  return (WSAStartup(version, &wsaData) == 0);
+#else
+  return TRUE;
+#endif
+}
+
+#define BUFFER_SIZE                (1024 * 96)
+
+#define GOT_A_NAL_CROSS_BUFFER     BUFFER_SIZE+1
+#define GOT_A_NAL_INCLUDE_A_BUFFER BUFFER_SIZE+2
+#define NO_MORE_BUFFER_TO_READ     BUFFER_SIZE+3
+
+static uint32_t m_nFileBufSize = 0;
+static uint32_t nalhead_pos = 0;
+static RTMP* m_pRtmp = NULL;
+static RTMPMetadata metaData;
+static unsigned char *m_pFileBuf = NULL;
+
+//we use this callback function to read data from buffer
+int read_buffer1(unsigned char *buf, int buf_size)
+{
+	stream_reader_frame_info_t  frame_info = {0};
+
+	StreamReader_GetFrame(fStream_reader, fFifo_reader, &frame_info);
+	DBG_MSG("1. frame size:%d\n", frame_info.frame_size);
+	while(frame_info.frame_size == 0) {
+		StreamReader_FreeFrame(fStream_reader, fFifo_reader, NULL);
+		usleep(15000);
+		StreamReader_GetFrame(fStream_reader, fFifo_reader, &frame_info);
+		DBG_MSG("2. frame size:%d\n", frame_info.frame_size);
+	}
+
+	DBG_MSG("3. frame size:%d\n", frame_info.frame_size);
+
+	if (frame_info.frame_size <= BUFFER_SIZE) {
+		memcpy(m_pFileBuf, frame_info.pFrame_addr, frame_info.frame_size);
+		m_nFileBufSize = frame_info.frame_size;
+	} else {
+		printf("frame size too large\n");
+		memcpy(m_pFileBuf, frame_info.pFrame_addr, BUFFER_SIZE);
+		m_nFileBufSize = BUFFER_SIZE;
+	}
+
+	StreamReader_FreeFrame(fStream_reader, fFifo_reader, NULL);
+
+	return m_nFileBufSize;
+}
+
+int RTMP264_Connect(const char* url)
+{
+	nalhead_pos = 0;
+	m_nFileBufSize = BUFFER_SIZE;
+	m_pFileBuf = (unsigned char*)malloc(BUFFER_SIZE);
+	if (m_pFileBuf == NULL) {
+		printf("malloc file buf failed\n");
+		return false;
+	}
+
+	InitSockets();
+
+	m_pRtmp = RTMP_Alloc();
+	RTMP_Init(m_pRtmp);
+	if (RTMP_SetupURL(m_pRtmp,(char*)url) == FALSE)	{
+		RTMP_Free(m_pRtmp);
+		free(m_pFileBuf);
+		return false;
+	}
+
+	RTMP_EnableWrite(m_pRtmp);
+	if (RTMP_Connect(m_pRtmp, NULL) == FALSE) {
+		RTMP_Free(m_pRtmp);
+		free(m_pFileBuf);
+		return false;
+	}
+
+	if (RTMP_ConnectStream(m_pRtmp,0) == FALSE)	{
+		RTMP_Close(m_pRtmp);
+		RTMP_Free(m_pRtmp);
+		free(m_pFileBuf);
+		return false;
+	}
+
+	return true;
+}
+
+inline void CleanupSockets()
+{
+	#ifdef WIN32
+		WSACleanup();
+	#endif
+}
+
+void RTMP264_Close()
+{
+	if(m_pRtmp) {
+        RTMP_Close(m_pRtmp);
+		RTMP_Free(m_pRtmp);
+		m_pRtmp = NULL;
+	}
+
+	CleanupSockets();
+
+	if (m_pFileBuf != NULL)	{
+		free(m_pFileBuf);
+	}
+
+	return;
+}
+
+int ReadFirstNaluFromBuf(NaluUnit &nalu, int (*read_buffer)(uint8_t *buf, int buf_size))
+{
+	uint32_t naltail_pos = nalhead_pos;
+
+	while(nalhead_pos < m_nFileBufSize) {
+		//search for nal header
+		if(m_pFileBuf[nalhead_pos++] == 0x00 && m_pFileBuf[nalhead_pos++] == 0x00) {
+			if(m_pFileBuf[nalhead_pos++] == 0x01) {
+				goto gotnal_head;
+			} else {
+				//cuz we have done an i++ before,so we need to roll back now
+				nalhead_pos--;
+				if(m_pFileBuf[nalhead_pos++] == 0x00 &&
+					m_pFileBuf[nalhead_pos++] == 0x01)
+					goto gotnal_head;
+				else
+					continue;
+			}
+		} else {
+			continue;
+		}
+
+		//search for nal tail which is also the head of next nal
+gotnal_head:
+		//normal case:the whole nal is in this m_pFileBuf
+		naltail_pos = nalhead_pos;
+		while (naltail_pos < m_nFileBufSize) {
+			if(m_pFileBuf[naltail_pos++] == 0x00 && m_pFileBuf[naltail_pos++] == 0x00 ) {
+				if(m_pFileBuf[naltail_pos++] == 0x01) {
+					nalu.size = (naltail_pos-3)-nalhead_pos;
+					break;
+				} else {
+					naltail_pos--;
+					if(m_pFileBuf[naltail_pos++] == 0x00 && m_pFileBuf[naltail_pos++] == 0x01) {
+						nalu.size = (naltail_pos-4)-nalhead_pos;
+						break;
+					}
+				}
+			}
+		}
+
+		nalu.type = m_pFileBuf[nalhead_pos]&0x1f;
+		nalu.data = (m_pFileBuf+nalhead_pos);
+		nalhead_pos = naltail_pos;
+		DBG_MSG("1. nalu type:%d\n", nalu.type);
+		return TRUE;
+	}
+}
+
+int ReadOneNaluFromBuf(NaluUnit &nalu,int (*read_buffer)(uint8_t *buf, int buf_size))
+{
+	static uint8_t read_new_frame = 0;
+	uint32_t naltail_pos = nalhead_pos;
+	int ret;
+	int nalustart;
+
+read_frame:
+	if (read_new_frame) {
+		read_new_frame = 0;
+		read_buffer(m_pFileBuf,m_nFileBufSize);
+		ReadFirstNaluFromBuf(nalu, read_buffer);
+		if (nalu.type != NALU_TYPE_SEI) {
+			return TRUE;
+		} else { // P frame, has 2 slices, 1st slice is sei, 2nd slice is non-idr slice, get the 2nd slice here
+			nalu.type = m_pFileBuf[nalhead_pos]&0x1f;
+			nalu.size = m_nFileBufSize - nalhead_pos;
+			nalu.data = (m_pFileBuf+nalhead_pos);
+			read_new_frame = 1;
+			nalhead_pos = 0;
+			DBG_MSG("2. nalu type:%d\n", nalu.type);
+			return TRUE;
+		}
+	}
+
+	nalu.type = m_pFileBuf[nalhead_pos]&0x1f;
+	if (nalu.type == NALU_TYPE_IDR) { // IDR slice
+		nalu.size = m_nFileBufSize - nalhead_pos;
+		nalu.data = (m_pFileBuf+nalhead_pos);
+		read_new_frame = 1;
+		nalhead_pos = 0;
+		DBG_MSG("A. nalu type:%d\n", nalu.type);
+		return TRUE;
+	}
+
+	nalu.size=0;
+	while(1) {
+		while(naltail_pos < m_nFileBufSize) {
+			//search for nal tail
+			if(m_pFileBuf[naltail_pos++] == 0x00 && m_pFileBuf[naltail_pos++] == 0x00) {
+				if(m_pFileBuf[naltail_pos++] == 0x01) {
+					nalustart = 3;
+					goto gotnal ;
+				} else {
+					//cuz we have done an i++ before,so we need to roll back now
+					naltail_pos--;
+					if(m_pFileBuf[naltail_pos++] == 0x00 && m_pFileBuf[naltail_pos++] == 0x01) {
+						nalustart = 4;
+						goto gotnal;
+					} else {
+						continue;
+					}
+				}
+			} else {
+				continue;
+			}
+
+			gotnal:
+ 				nalu.type = m_pFileBuf[nalhead_pos]&0x1f;
+				nalu.size = naltail_pos - nalhead_pos - nalustart;
+				if(nalu.type == NALU_TYPE_SEI) {
+					nalhead_pos = naltail_pos;
+					continue;
+				}
+				nalu.data = (m_pFileBuf+nalhead_pos);
+				nalhead_pos = naltail_pos;
+				DBG_MSG("3. nalu type:%d\n", nalu.type);
+				return TRUE;
+		}
+
+		// reach the end of the frame
+		read_new_frame = 1;
+		nalu.type = m_pFileBuf[nalhead_pos]&0x1f;
+		nalu.size = m_nFileBufSize - nalhead_pos;
+		nalhead_pos = 0;
+		if(nalu.type == NALU_TYPE_SEI) {
+			DBG_MSG("end frame nalu type is 0x06, skip\n");
+			goto read_frame;
+		}
+		nalu.data = (m_pFileBuf+nalhead_pos);
+		DBG_MSG("4. nalu type:%d\n", nalu.type);
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+int SendVideoSpsPps(unsigned char *pps,int pps_len,unsigned char * sps,int sps_len)
+{
+	RTMPPacket * packet=NULL;//rtmp¡ã¨¹?¨¢11
+	unsigned char * body=NULL;
+	int i;
+	packet = (RTMPPacket *)malloc(RTMP_HEAD_SIZE+1024);
+	//RTMPPacket_Reset(packet);//????packet¡Á¡ä¨¬?
+	memset(packet,0,RTMP_HEAD_SIZE+1024);
+	packet->m_body = (char *)packet + RTMP_HEAD_SIZE;
+	body = (unsigned char *)packet->m_body;
+	i = 0;
+	body[i++] = 0x17;
+	body[i++] = 0x00;
+
+	body[i++] = 0x00;
+	body[i++] = 0x00;
+	body[i++] = 0x00;
+
+	/*AVCDecoderConfigurationRecord*/
+	body[i++] = 0x01;
+	body[i++] = sps[1];
+	body[i++] = sps[2];
+	body[i++] = sps[3];
+	body[i++] = 0xff;
+
+	/*sps*/
+	body[i++]   = 0xe1;
+	body[i++] = (sps_len >> 8) & 0xff;
+	body[i++] = sps_len & 0xff;
+	memcpy(&body[i],sps,sps_len);
+	i +=  sps_len;
+
+	/*pps*/
+	body[i++]   = 0x01;
+	body[i++] = (pps_len >> 8) & 0xff;
+	body[i++] = (pps_len) & 0xff;
+	memcpy(&body[i],pps,pps_len);
+	i +=  pps_len;
+
+	packet->m_packetType = RTMP_PACKET_TYPE_VIDEO;
+	packet->m_nBodySize = i;
+	packet->m_nChannel = 0x04;
+	packet->m_nTimeStamp = 0;
+	packet->m_hasAbsTimestamp = 0;
+	packet->m_headerType = RTMP_PACKET_SIZE_MEDIUM;
+	packet->m_nInfoField2 = m_pRtmp->m_stream_id;
+
+	int nRet = RTMP_SendPacket(m_pRtmp,packet,TRUE);
+	free(packet);
+	return nRet;
+}
+
+int SendPacket(unsigned int nPacketType,unsigned char *data,unsigned int size,unsigned int nTimestamp)
+{
+	uint32_t start_time = 0;
+	uint32_t end_time = 0;
+	RTMPPacket* packet;
+
+	packet = (RTMPPacket *)malloc(RTMP_HEAD_SIZE+size);
+	memset(packet,0,RTMP_HEAD_SIZE);
+
+	packet->m_body = (char *)packet + RTMP_HEAD_SIZE;
+	packet->m_nBodySize = size;
+	start_time = RTMP_GetTime();
+	memcpy(packet->m_body,data,size);
+	end_time = RTMP_GetTime();
+	DBG_MSG("memcpy time:%d\n", end_time-start_time);
+	packet->m_hasAbsTimestamp = 0;
+	packet->m_packetType = nPacketType;
+	packet->m_nInfoField2 = m_pRtmp->m_stream_id;
+	packet->m_nChannel = 0x04;
+
+	packet->m_headerType = RTMP_PACKET_SIZE_LARGE;
+	if (RTMP_PACKET_TYPE_AUDIO ==nPacketType && size !=4) {
+		packet->m_headerType = RTMP_PACKET_SIZE_MEDIUM;
+	}
+	packet->m_nTimeStamp = nTimestamp;
+
+	int nRet =0;
+	if (RTMP_IsConnected(m_pRtmp)) {
+		start_time = RTMP_GetTime();
+		nRet = RTMP_SendPacket(m_pRtmp,packet,TRUE);
+		end_time = RTMP_GetTime();
+		DBG_MSG("send time:%d\n", end_time-start_time);
+	}
+
+	free(packet);
+	return nRet;
+}
+
+int SendH264Packet(unsigned char *data,unsigned int size,int bIsKeyFrame,unsigned int nTimeStamp)
+{
+	uint32_t start_time = 0;
+	uint32_t end_time = 0;
+
+	start_time = RTMP_GetTime();
+
+	if(data == NULL && size<11){
+		return false;
+	}
+
+	unsigned char *body = (unsigned char*)malloc(size+9);
+	memset(body,0,size+9);
+
+	int i = 0;
+	if(bIsKeyFrame){
+		body[i++] = 0x17;// 1:Iframe  7:AVC
+		body[i++] = 0x01;// AVC NALU
+		body[i++] = 0x00;
+		body[i++] = 0x00;
+		body[i++] = 0x00;
+
+
+		// NALU size
+		body[i++] = size>>24 &0xff;
+		body[i++] = size>>16 &0xff;
+		body[i++] = size>>8 &0xff;
+		body[i++] = size&0xff;
+		// NALU data
+		memcpy(&body[i],data,size);
+		SendVideoSpsPps(metaData.Pps,metaData.nPpsLen,metaData.Sps,metaData.nSpsLen);
+	}else{
+		body[i++] = 0x27;// 2:Pframe  7:AVC
+		body[i++] = 0x01;// AVC NALU
+		body[i++] = 0x00;
+		body[i++] = 0x00;
+		body[i++] = 0x00;
+
+
+		// NALU size
+		body[i++] = size>>24 &0xff;
+		body[i++] = size>>16 &0xff;
+		body[i++] = size>>8 &0xff;
+		body[i++] = size&0xff;
+		// NALU data
+		memcpy(&body[i],data,size);
+	}
+
+
+	int bRet = SendPacket(RTMP_PACKET_TYPE_VIDEO,body,i+size,nTimeStamp);
+	free(body);
+
+	end_time = RTMP_GetTime();
+	DBG_MSG("SendH264Pkt time:%d\n", end_time-start_time);
+
+	return bRet;
+}
+
+typedef  unsigned int UINT;
+typedef  unsigned char BYTE;
+typedef  unsigned long DWORD;
+
+UINT Ue(BYTE *pBuff, UINT nLen, UINT &nStartBit)
+{
+	UINT nZeroNum = 0;
+	while (nStartBit < nLen * 8) {
+		if (pBuff[nStartBit / 8] & (0x80 >> (nStartBit % 8)))
+		{
+			break;
+		}
+		nZeroNum++;
+		nStartBit++;
+	}
+	nStartBit ++;
+
+	DWORD dwRet = 0;
+	for (UINT i=0; i<nZeroNum; i++)
+	{
+		dwRet <<= 1;
+		if (pBuff[nStartBit / 8] & (0x80 >> (nStartBit % 8)))
+		{
+			dwRet += 1;
+		}
+		nStartBit++;
+	}
+	return (1 << nZeroNum) - 1 + dwRet;
+}
+
+
+int Se(BYTE *pBuff, UINT nLen, UINT &nStartBit)
+{
+	int UeVal=Ue(pBuff,nLen,nStartBit);
+	double k=UeVal;
+	int nValue = ceil(k/2);
+	if (UeVal % 2==0)
+		nValue=-nValue;
+	return nValue;
+}
+
+
+DWORD u(UINT BitCount,BYTE * buf,UINT &nStartBit)
+{
+	DWORD dwRet = 0;
+	for (UINT i=0; i<BitCount; i++)
+	{
+		dwRet <<= 1;
+		if (buf[nStartBit / 8] & (0x80 >> (nStartBit % 8)))
+		{
+			dwRet += 1;
+		}
+		nStartBit++;
+	}
+	return dwRet;
+}
+
+void de_emulation_prevention(BYTE* buf,unsigned int* buf_size)
+{
+	int i=0,j=0;
+	BYTE* tmp_ptr=NULL;
+	unsigned int tmp_buf_size=0;
+	int val=0;
+
+	tmp_ptr=buf;
+	tmp_buf_size=*buf_size;
+	for(i=0;i<(tmp_buf_size-2);i++)
+	{
+		//check for 0x000003
+		val=(tmp_ptr[i]^0x00) +(tmp_ptr[i+1]^0x00)+(tmp_ptr[i+2]^0x03);
+		if(val==0)
+		{
+			//kick out 0x03
+			for(j=i+2;j<tmp_buf_size-1;j++)
+				tmp_ptr[j]=tmp_ptr[j+1];
+
+			//and so we should devrease bufsize
+			(*buf_size)--;
+		}
+	}
+
+	return;
+}
+
+int h264_decode_sps(BYTE * buf,unsigned int nLen,int &width,int &height,int &fps)
+{
+	UINT StartBit=0;
+	fps=0;
+	de_emulation_prevention(buf,&nLen);
+
+	int forbidden_zero_bit=u(1,buf,StartBit);
+	int nal_ref_idc=u(2,buf,StartBit);
+	int nal_unit_type=u(5,buf,StartBit);
+	if(nal_unit_type==7)
+	{
+		int profile_idc=u(8,buf,StartBit);
+		int constraint_set0_flag=u(1,buf,StartBit);//(buf[1] & 0x80)>>7;
+		int constraint_set1_flag=u(1,buf,StartBit);//(buf[1] & 0x40)>>6;
+		int constraint_set2_flag=u(1,buf,StartBit);//(buf[1] & 0x20)>>5;
+		int constraint_set3_flag=u(1,buf,StartBit);//(buf[1] & 0x10)>>4;
+		int reserved_zero_4bits=u(4,buf,StartBit);
+		int level_idc=u(8,buf,StartBit);
+
+		int seq_parameter_set_id=Ue(buf,nLen,StartBit);
+
+		if( profile_idc == 100 || profile_idc == 110 ||
+			profile_idc == 122 || profile_idc == 144 )
+		{
+			int chroma_format_idc=Ue(buf,nLen,StartBit);
+			if( chroma_format_idc == 3 )
+				int residual_colour_transform_flag=u(1,buf,StartBit);
+			int bit_depth_luma_minus8=Ue(buf,nLen,StartBit);
+			int bit_depth_chroma_minus8=Ue(buf,nLen,StartBit);
+			int qpprime_y_zero_transform_bypass_flag=u(1,buf,StartBit);
+			int seq_scaling_matrix_present_flag=u(1,buf,StartBit);
+
+			int seq_scaling_list_present_flag[8];
+			if( seq_scaling_matrix_present_flag )
+			{
+				for( int i = 0; i < 8; i++ ) {
+					seq_scaling_list_present_flag[i]=u(1,buf,StartBit);
+				}
+			}
+		}
+		int log2_max_frame_num_minus4=Ue(buf,nLen,StartBit);
+		int pic_order_cnt_type=Ue(buf,nLen,StartBit);
+		if( pic_order_cnt_type == 0 )
+			int log2_max_pic_order_cnt_lsb_minus4=Ue(buf,nLen,StartBit);
+		else if( pic_order_cnt_type == 1 )
+		{
+			int delta_pic_order_always_zero_flag=u(1,buf,StartBit);
+			int offset_for_non_ref_pic=Se(buf,nLen,StartBit);
+			int offset_for_top_to_bottom_field=Se(buf,nLen,StartBit);
+			int num_ref_frames_in_pic_order_cnt_cycle=Ue(buf,nLen,StartBit);
+
+			int *offset_for_ref_frame=new int[num_ref_frames_in_pic_order_cnt_cycle];
+			for( int i = 0; i < num_ref_frames_in_pic_order_cnt_cycle; i++ )
+				offset_for_ref_frame[i]=Se(buf,nLen,StartBit);
+			delete [] offset_for_ref_frame;
+		}
+		int num_ref_frames=Ue(buf,nLen,StartBit);
+		int gaps_in_frame_num_value_allowed_flag=u(1,buf,StartBit);
+		int pic_width_in_mbs_minus1=Ue(buf,nLen,StartBit);
+		int pic_height_in_map_units_minus1=Ue(buf,nLen,StartBit);
+
+		width=(pic_width_in_mbs_minus1+1)*16;
+		height=(pic_height_in_map_units_minus1+1)*16;
+
+		int frame_mbs_only_flag=u(1,buf,StartBit);
+		if(!frame_mbs_only_flag)
+			int mb_adaptive_frame_field_flag=u(1,buf,StartBit);
+
+		int direct_8x8_inference_flag=u(1,buf,StartBit);
+		int frame_cropping_flag=u(1,buf,StartBit);
+		if(frame_cropping_flag)
+		{
+			int frame_crop_left_offset=Ue(buf,nLen,StartBit);
+			int frame_crop_right_offset=Ue(buf,nLen,StartBit);
+			int frame_crop_top_offset=Ue(buf,nLen,StartBit);
+			int frame_crop_bottom_offset=Ue(buf,nLen,StartBit);
+		}
+		int vui_parameter_present_flag=u(1,buf,StartBit);
+		if(vui_parameter_present_flag)
+		{
+			int aspect_ratio_info_present_flag=u(1,buf,StartBit);
+			if(aspect_ratio_info_present_flag)
+			{
+				int aspect_ratio_idc=u(8,buf,StartBit);
+				if(aspect_ratio_idc==255)
+				{
+					int sar_width=u(16,buf,StartBit);
+					int sar_height=u(16,buf,StartBit);
+				}
+			}
+			int overscan_info_present_flag=u(1,buf,StartBit);
+			if(overscan_info_present_flag)
+				int overscan_appropriate_flagu=u(1,buf,StartBit);
+			int video_signal_type_present_flag=u(1,buf,StartBit);
+			if(video_signal_type_present_flag)
+			{
+				int video_format=u(3,buf,StartBit);
+				int video_full_range_flag=u(1,buf,StartBit);
+				int colour_description_present_flag=u(1,buf,StartBit);
+				if(colour_description_present_flag)
+				{
+					int colour_primaries=u(8,buf,StartBit);
+					int transfer_characteristics=u(8,buf,StartBit);
+					int matrix_coefficients=u(8,buf,StartBit);
+				}
+			}
+			int chroma_loc_info_present_flag=u(1,buf,StartBit);
+			if(chroma_loc_info_present_flag)
+			{
+				int chroma_sample_loc_type_top_field=Ue(buf,nLen,StartBit);
+				int chroma_sample_loc_type_bottom_field=Ue(buf,nLen,StartBit);
+			}
+			int timing_info_present_flag=u(1,buf,StartBit);
+			if(timing_info_present_flag)
+			{
+				int num_units_in_tick=u(32,buf,StartBit);
+				int time_scale=u(32,buf,StartBit);
+				fps=time_scale/(2*num_units_in_tick);
+			}
+		}
+		return true;
+	}
+	else
+		return false;
+}
+
+
+int RTMP264_Send(int (*read_buffer)(unsigned char *buf, int buf_size))
+{
+    int ret;
+    uint32_t now,last_update;
+
+    memset(&metaData,0,sizeof(RTMPMetadata));
+    memset(m_pFileBuf,0,BUFFER_SIZE);
+
+    if((ret = read_buffer(m_pFileBuf,m_nFileBufSize))<0) {
+        return FALSE;
+    }
+
+    NaluUnit naluUnit;
+    ReadFirstNaluFromBuf(naluUnit,read_buffer);
+    metaData.nSpsLen = naluUnit.size;
+    metaData.Sps = NULL;
+    metaData.Sps = (unsigned char*)malloc(naluUnit.size);
+    memcpy(metaData.Sps,naluUnit.data,naluUnit.size);
+
+    ReadOneNaluFromBuf(naluUnit,read_buffer);
+    metaData.nPpsLen = naluUnit.size;
+    metaData.Pps = NULL;
+    metaData.Pps = (unsigned char*)malloc(naluUnit.size);
+    memcpy(metaData.Pps,naluUnit.data,naluUnit.size);
+
+    int width = 0,height = 0, fps=0;
+	h264_decode_sps(metaData.Sps, metaData.nSpsLen, width, height, fps);
+
+	if(fps)
+		metaData.nFrameRate = fps;
+	else
+		metaData.nFrameRate = 25;
+
+	unsigned int tick = 0;
+	unsigned int tick_gap = 1000/metaData.nFrameRate;
+	ReadOneNaluFromBuf(naluUnit,read_buffer);
+	int bKeyframe  = (naluUnit.type == 0x05) ? TRUE : FALSE;
+
+	while(SendH264Packet(naluUnit.data,naluUnit.size,bKeyframe,tick))
+	{
+got_sps_pps:
+		//if(naluUnit.size==8581)
+		DBG_MSG("NALU size:%8d\n",naluUnit.size);
+		if(!ReadOneNaluFromBuf(naluUnit,read_buffer)) {
+			DBG_MSG("read one nalu failed\n");
+			goto end;
+		}
+
+		if (naluUnit.type == NALU_TYPE_SPS) {
+			if (metaData.Sps != NULL) {
+				free(metaData.Sps);
+			}
+			metaData.nSpsLen = naluUnit.size;
+    		metaData.Sps = NULL;
+    		metaData.Sps = (unsigned char*)malloc(naluUnit.size);
+    		memcpy(metaData.Sps, naluUnit.data, naluUnit.size);
+    		goto got_sps_pps;
+		}
+
+		if (naluUnit.type == NALU_TYPE_PPS) {
+			if (metaData.Pps != NULL) {
+				free(metaData.Pps);
+			}
+
+			metaData.nPpsLen = naluUnit.size;
+    		metaData.Pps = NULL;
+    		metaData.Pps = (unsigned char*)malloc(naluUnit.size);
+    		memcpy(metaData.Pps, naluUnit.data, naluUnit.size);
+    		goto got_sps_pps;
+		}
+
+		bKeyframe  = (naluUnit.type == NALU_TYPE_IDR) ? TRUE : FALSE;
+		tick += tick_gap;
+	}
+	end:
+	if (metaData.Sps != NULL) {
+		free(metaData.Sps);
+	}
+
+	if (metaData.Pps != NULL) {
+		free(metaData.Pps);
+	}
+
+	return TRUE;
+}
+
+
+int main(int argc, char **argv)
+{
+    printf("in rtmph264 prog \n");
+    char* ip = NULL;
+    char url[256] = {0};
+    int rval = -1;
+
+    if (argc < 2) {
+            printf("usage: %s ip", argv[0]);
+            return -1;
+    }
+
+    ip = argv[1];
+    sprintf(url, "rtmp://%s:1935/mylive/livestream", ip);
+
+    printf("in rtmph264 prog: ip: %s \n", ip);
+
+	RTMP264_Connect(url);
+
+    StreamReader_CreateHandle(&fStream_reader, &stream_init_info);
+
+	memset(&fifo_init_info, 0x0, sizeof(stream_fifo_reader_init_t));
+    fifo_init_info.fifo_type = STREAM_TRACK_VIDEO;
+    fifo_init_info.stream_type     = STREAM_TYPE_LIVE;
+    fifo_init_info.fifo_cache_size = MAX_VIDEO_FIFO_CACHE_SIZE_LIVE;
+    rval = StreamReader_OpenVFifoReader(fStream_reader, &fifo_init_info, &fFifo_reader);
+    if (rval < 0) {
+		printf("Open VFifo failed\n");
+    } else {
+		printf("Open VFifo success\n");
+    }
+
+    StreamReader_StartVFifo(fStream_reader, fFifo_reader);
+	printf("start vfifo success\n");
+	RTMP264_Send(read_buffer1);
+
+	RTMP264_Close();
+
+	return 0;
+}
+
